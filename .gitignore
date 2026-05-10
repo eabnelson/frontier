@@ -1,0 +1,5 @@
+.DS_Store
+node_modules/
+
+# Project-local generated Frontier state.
+.frontier/
