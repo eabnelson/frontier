@@ -1,5 +1,8 @@
 .DS_Store
 node_modules/
 
+# Local Clawpatch audit/review state.
+.clawpatch/
+
 # Project-local generated Frontier state.
 .frontier/

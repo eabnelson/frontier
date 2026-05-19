@@ -38,6 +38,31 @@ node "$FT" actions create \
 node "$FT" trace @action/smoke-recommendation --json | grep -q '"producedBy"'
 node "$FT" actions search smoke --json | grep -q '@action/smoke-recommendation'
 node "$FT" status --json | grep -q '"records": 5'
+node "$FT" --json status | grep -q '"records": 5'
+
+FIRST_DUPLICATE="$(node "$FT" ingest text "First duplicate body." --title "Repeated Note" --json)"
+SECOND_DUPLICATE="$(node "$FT" ingest text "Second duplicate body." --title "Repeated Note" --json)"
+node -e '
+  const first = JSON.parse(process.argv[1]);
+  const second = JSON.parse(process.argv[2]);
+  if (first.ref !== "@ingestion/repeated-note") process.exit(1);
+  if (second.ref !== "@ingestion/repeated-note-2") process.exit(1);
+' "$FIRST_DUPLICATE" "$SECOND_DUPLICATE"
+
+CONCURRENT_DIR="$WORK_DIR/concurrent"
+mkdir -p "$CONCURRENT_DIR"
+cd "$CONCURRENT_DIR"
+node "$FT" init "Concurrent Project" --json >/dev/null
+for index in 1 2 3 4 5 6 7 8; do
+  node "$FT" ingest text "Concurrent body $index." --title "Concurrent Note $index" --json >/dev/null &
+done
+wait
+CONCURRENT_STATUS="$(node "$FT" status --json)"
+node -e '
+  const status = JSON.parse(process.argv[1]);
+  if (status.records !== 8) process.exit(1);
+  if (status.events !== 8) process.exit(1);
+' "$CONCURRENT_STATUS"
 
 LEGACY_DIR="$WORK_DIR/legacy"
 mkdir -p "$LEGACY_DIR/.frontier"

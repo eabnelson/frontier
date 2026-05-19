@@ -7,11 +7,11 @@
     "node": ">=24.0.0"
   },
   "bin": {
-    "ft": "./bin/ft.mjs",
-    "frontier": "./bin/ft.mjs"
+    "ft": "./bin/ft.mjs"
   },
   "scripts": {
     "ft": "node ./bin/ft.mjs",
+    "test:metadata": "node ./scripts/package-metadata-test.mjs",
     "test:smoke": "node ./bin/ft.mjs --help",
     "test:cli": "./scripts/smoke-test.sh"
   }

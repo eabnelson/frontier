@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, copyFileSync } from "node:fs";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { cwd, exit, stdin } from "node:process";
 import { DatabaseSync } from "node:sqlite";
@@ -13,9 +13,39 @@ const CLI_VERSION = PACKAGE.version;
 
 const RECORD_TYPES = new Set(["context", "ingestion", "synthesis", "action", "session", "artifact"]);
 const GLOBAL_FLAGS = new Set(["help", "h", "version", "json", "plain", "quiet", "q", "verbose", "v", "noInput", "noColor", "frontierDir"]);
+const VALUE_FLAGS = new Set([
+  "frontierDir",
+  "title",
+  "tags",
+  "observedAt",
+  "goal",
+  "context",
+  "ingestion",
+  "summary",
+  "prompt",
+  "agent",
+  "model",
+  "type",
+  "fromSynthesis",
+  "body",
+  "status",
+  "actor",
+  "interface",
+  "path",
+]);
+const LOCK_STALE_MS = 30_000;
+const activeLockReleases = new Set();
+
+process.on("exit", () => {
+  for (const release of activeLockReleases) release();
+});
 
 function now() {
   return new Date().toISOString();
+}
+
+function sleep(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function slugify(value) {
@@ -58,7 +88,7 @@ function parseArgs(argv) {
     }
 
     const next = argv[i + 1];
-    if (next && !next.startsWith("--")) {
+    if (VALUE_FLAGS.has(key) && next && !next.startsWith("--")) {
       flags[key] = next;
       i += 1;
     } else {
@@ -156,7 +186,57 @@ function requireFrontier() {
   return path;
 }
 
-function loadStore(required = true) {
+function acquireStoreLock(frontierDir) {
+  const locksDir = join(frontierDir, "locks");
+  const lockDir = join(locksDir, "store.lock");
+  mkdirSync(locksDir, { recursive: true });
+
+  while (true) {
+    try {
+      mkdirSync(lockDir);
+      try {
+        writeFileSync(join(lockDir, "owner.json"), `${JSON.stringify({ pid: process.pid, createdAt: now() })}\n`);
+      } catch (error) {
+        rmSync(lockDir, { recursive: true, force: true });
+        if (error.code === "ENOENT") continue;
+        throw error;
+      }
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        activeLockReleases.delete(release);
+        rmSync(lockDir, { recursive: true, force: true });
+      };
+      activeLockReleases.add(release);
+      return release;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      try {
+        const owner = JSON.parse(readFileSync(join(lockDir, "owner.json"), "utf8"));
+        if (Date.now() - Date.parse(owner.createdAt) > LOCK_STALE_MS) {
+          rmSync(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        let ageMs = 0;
+        try {
+          ageMs = Date.now() - statSync(lockDir).mtimeMs;
+        } catch (error) {
+          if (error.code === "ENOENT") continue;
+          throw error;
+        }
+        if (ageMs > LOCK_STALE_MS) {
+          rmSync(lockDir, { recursive: true, force: true });
+          continue;
+        }
+      }
+      sleep(50);
+    }
+  }
+}
+
+function loadStore(required = true, options = {}) {
   const path = required ? requireFrontier() : frontierPath();
   if (!path) return null;
   const storePath = join(path, STORE_FILE);
@@ -164,20 +244,34 @@ function loadStore(required = true) {
     const legacyData = JSON.parse(readFileSync(join(path, LEGACY_STORE_FILE), "utf8"));
     saveSqliteStore(storePath, legacyData);
   }
-  return {
-    dir: path,
-    storePath,
-    data: loadSqliteStore(storePath),
-  };
+  const releaseLock = options.write ? acquireStoreLock(path) : null;
+  try {
+    return {
+      dir: path,
+      storePath,
+      data: loadSqliteStore(storePath),
+      releaseLock,
+    };
+  } catch (error) {
+    releaseLock?.();
+    throw error;
+  }
 }
 
 function saveStore(loaded) {
   loaded.data.updatedAt = now();
-  saveSqliteStore(loaded.storePath, loaded.data);
+  try {
+    saveSqliteStore(loaded.storePath, loaded.data);
+  } finally {
+    loaded.releaseLock?.();
+  }
 }
 
 function maybeSaveStore(loaded, flags) {
-  if (flags.dryRun) return;
+  if (flags.dryRun) {
+    loaded.releaseLock?.();
+    return;
+  }
   saveStore(loaded);
 }
 
@@ -431,6 +525,17 @@ function nextId(store, type, title) {
   return `${prefixes[type]}_${slugify(title)}_${store.counters[type]}`;
 }
 
+function nextRef(store, type, title) {
+  const baseRef = `@${type}/${slugify(title)}`;
+  const existingRefs = new Set(store.records.map((record) => record.ref));
+  if (!existingRefs.has(baseRef)) return baseRef;
+
+  for (let index = 2; ; index += 1) {
+    const candidate = `${baseRef}-${index}`;
+    if (!existingRefs.has(candidate)) return candidate;
+  }
+}
+
 function addEvent(store, type, payload = {}) {
   const event = {
     id: `evt_${store.events.length + 1}`,
@@ -463,7 +568,7 @@ function createRecord(store, type, attrs) {
     status: attrs.status || "active",
     tags: attrs.tags || [],
   };
-  record.ref = record.ref || `@${type}/${slugify(record.title)}`;
+  record.ref = record.ref || nextRef(store, type, record.title);
   store.records.push(record);
   addEvent(store, "record.created", { recordId: record.id, recordRef: record.ref, recordType: type });
   return record;
@@ -728,7 +833,8 @@ function handleTypedRecords(type, subcommand, args, flags) {
     text: ["title", "tags", "observedAt", "stdin", "dryRun"],
   };
   validateFlags(flags, allowed[subcommand] || []);
-  const loaded = loadStore();
+  const isWrite = (type === "context" && subcommand === "add") || (type === "ingestion" && ["file", "text"].includes(subcommand));
+  const loaded = loadStore(true, { write: isWrite && !flags.dryRun });
   const store = loaded.data;
 
   if (subcommand === "list") {
@@ -807,7 +913,8 @@ function handleSession(subcommand, args, flags) {
     context: [],
   };
   validateFlags(flags, allowed[subcommand] || []);
-  const loaded = loadStore();
+  const isWrite = ["start", "attach"].includes(subcommand);
+  const loaded = loadStore(true, { write: isWrite && !flags.dryRun });
   const store = loaded.data;
 
   if (subcommand === "start") {
@@ -875,7 +982,7 @@ function handleSession(subcommand, args, flags) {
 function handleSynth(subcommand, args, flags) {
   validateFlags(flags, ["goal", "context", "ingestion", "summary", "prompt", "agent", "model", "dryRun"]);
   if (subcommand !== "create") die(`unknown command: ft synth ${subcommand || ""}`.trim(), 2);
-  const loaded = loadStore();
+  const loaded = loadStore(true, { write: !flags.dryRun });
   const store = loaded.data;
   const goal = flags.goal || args.join(" ");
   if (!goal) die(commandHelp("synth", "create"), 2);
@@ -916,7 +1023,7 @@ function handleActions(subcommand, args, flags) {
     create: ["title", "type", "fromSynthesis", "body", "status", "dryRun"],
   };
   validateFlags(flags, allowed[subcommand] || []);
-  const loaded = loadStore();
+  const loaded = loadStore(true, { write: subcommand === "create" && !flags.dryRun });
   const store = loaded.data;
 
   if (subcommand === "list") {
