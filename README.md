@@ -75,5 +75,7 @@ The command surface is documented in [CLI Spec](./docs/cli-spec.md). In short:
 - Primary output goes to stdout; diagnostics and errors go to stderr.
 - Use `--json` for agent-readable output.
 - Use `--plain` for stable line-oriented output where supported.
+- Use `ft agent-context --json` for versioned machine-readable command introspection.
+- List-style JSON output is bounded by default and returns `nextCursor` when more items are available.
 - Invalid usage exits `2`; runtime failures exit `1`.
 - Write commands support `--dry-run` where they mutate Frontier state or files.

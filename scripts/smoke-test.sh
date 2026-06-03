@@ -39,6 +39,14 @@ node "$FT" trace @action/smoke-recommendation --json | grep -q '"producedBy"'
 node "$FT" actions search smoke --json | grep -q '@action/smoke-recommendation'
 node "$FT" status --json | grep -q '"records": 5'
 node "$FT" --json status | grep -q '"records": 5'
+node "$FT" agent-context --json | grep -q '"schema_version": "1"'
+node "$FT" agent-context --json | grep -q '"agent-context"'
+node "$FT" agent-context --json | grep -q '"projects"'
+node "$FT" agent-context --json | grep -q '"usage": "ft status'
+if node "$FT" agent-context --plain >/dev/null 2>&1; then
+  echo "agent-context --plain should fail" >&2
+  exit 1
+fi
 
 FIRST_DUPLICATE="$(node "$FT" ingest text "First duplicate body." --title "Repeated Note" --json)"
 SECOND_DUPLICATE="$(node "$FT" ingest text "Second duplicate body." --title "Repeated Note" --json)"
@@ -48,6 +56,14 @@ node -e '
   if (first.ref !== "@ingestion/repeated-note") process.exit(1);
   if (second.ref !== "@ingestion/repeated-note-2") process.exit(1);
 ' "$FIRST_DUPLICATE" "$SECOND_DUPLICATE"
+
+PAGED_INGESTION="$(node "$FT" ingest list --json --limit 1)"
+node -e '
+  const page = JSON.parse(process.argv[1]);
+  if (!Array.isArray(page.items) || page.items.length !== 1) process.exit(1);
+  if (page.limit !== 1 || page.cursor !== 0) process.exit(1);
+  if (page.total < 3 || page.truncated !== true || page.nextCursor !== "1") process.exit(1);
+' "$PAGED_INGESTION"
 
 CONCURRENT_DIR="$WORK_DIR/concurrent"
 mkdir -p "$CONCURRENT_DIR"

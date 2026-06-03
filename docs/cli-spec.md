@@ -29,6 +29,8 @@ ft [global flags] <command> [args]
 | `--no-input` | Disable prompts. Frontier currently never prompts. |
 | `--no-color` | Disable color. Frontier currently emits no color. |
 | `--frontier-dir <path>` | Use a specific `.frontier` directory instead of cwd discovery. |
+| `--limit <n>` | Limit list-style output to 1-100 items. Default: 20. |
+| `--cursor <n>` | Continue list-style output from an offset cursor. |
 
 `--json` and `--plain` are mutually exclusive.
 
@@ -41,32 +43,34 @@ ft projects [--json|--plain]
 ft status [--json|--plain]
 
 ft context add <file> [--title <title>] [--tags <refs>] [--dry-run]
-ft context list [--json|--plain]
+ft context list [--json|--plain] [--limit <n>] [--cursor <n>]
 ft context show <ref> [--json]
 
 ft ingest file <file> [--title <title>] [--tags <refs>] [--observed-at <iso>] [--dry-run]
 ft ingest text <text>|--stdin --title <title> [--tags <refs>] [--observed-at <iso>] [--dry-run]
-ft ingest list [--json|--plain]
+ft ingest list [--json|--plain] [--limit <n>] [--cursor <n>]
 ft ingest show <ref> [--json]
 
 ft synth create --goal <goal> [--context <refs>] [--ingestion <refs>] [--summary <text>] [--prompt <text>] [--agent <name>] [--model <name>] [--dry-run]
 
 ft actions create --type <type> --title <title> [--from-synthesis <ref>] --body <file-or-text|-> [--status <status>] [--dry-run]
-ft actions list [--json|--plain]
+ft actions list [--json|--plain] [--limit <n>] [--cursor <n>]
 ft actions show <ref> [--json]
-ft actions search <query> [--json|--plain]
+ft actions search <query> [--json|--plain] [--limit <n>] [--cursor <n>]
 
 ft session start <title> [--actor <actor>] [--interface <name>] [--dry-run]
 ft session current [--json|--plain]
 ft session attach <ref> [--dry-run]
-ft session refs [--json|--plain]
+ft session refs [--json|--plain] [--limit <n>] [--cursor <n>]
 ft session context [--json]
 
 ft wiki list [--json|--plain]
-ft wiki show <domain> [--json]
-ft wiki map <domain> [--json]
+ft wiki show <domain> [--json] [--limit <n>] [--cursor <n>]
+ft wiki map <domain> [--json] [--limit <n>] [--cursor <n>]
 ft wiki entrypoints [--json]
-ft wiki related <ref> [--json|--plain]
+ft wiki related <ref> [--json|--plain] [--limit <n>] [--cursor <n>]
+
+ft agent-context [--json]
 
 ft agent docs codex|claude [--json]
 ft agent write codex|claude [--path AGENTS.md] [--force] [--dry-run]
@@ -79,6 +83,22 @@ ft trace <ref> [--json]
 Primary command output goes to stdout. Diagnostics and errors go to stderr.
 
 Human output is optimized for reading in a terminal. JSON output is for agents and scripts. Plain output is stable line-oriented text, usually one path or record ref per line.
+
+List-style JSON output is bounded and returns pagination metadata:
+
+```json
+{
+  "items": [],
+  "total": 0,
+  "limit": 20,
+  "cursor": 0,
+  "nextCursor": null,
+  "truncated": false,
+  "hint": null
+}
+```
+
+When `truncated` is true, pass `nextCursor` back as `--cursor <nextCursor>` or narrow the command with a smaller query.
 
 Text bodies can be passed with stdin where supported:
 
@@ -102,6 +122,12 @@ Write commands support `--dry-run` where they change Frontier state or write fil
 Frontier currently does not prompt. Future interactive commands must only prompt when stdin is a TTY and must fail fast under `--no-input`.
 
 Future destructive commands must require an interactive confirmation, `--force`, or an explicit confirmation flag.
+
+## Agent Introspection
+
+`ft agent-context --json` prints a versioned machine-readable map of the command surface. It includes the CLI version, output conventions, exit codes, pagination limits, current project/session metadata when available, and command flag schemas.
+
+Agents should prefer `ft agent-context --json` over scraping `ft --help` when they need to discover Frontier's shape.
 
 ## Env And Config
 

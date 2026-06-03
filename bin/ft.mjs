@@ -10,11 +10,16 @@ const STORE_FILE = "frontier.db";
 const LEGACY_STORE_FILE = "frontier.json";
 const PACKAGE = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 const CLI_VERSION = PACKAGE.version;
+const AGENT_CONTEXT_SCHEMA_VERSION = "1";
+const DEFAULT_LIST_LIMIT = 20;
+const MAX_LIST_LIMIT = 100;
 
 const RECORD_TYPES = new Set(["context", "ingestion", "synthesis", "action", "session", "artifact"]);
 const GLOBAL_FLAGS = new Set(["help", "h", "version", "json", "plain", "quiet", "q", "verbose", "v", "noInput", "noColor", "frontierDir"]);
 const VALUE_FLAGS = new Set([
   "frontierDir",
+  "limit",
+  "cursor",
   "title",
   "tags",
   "observedAt",
@@ -144,6 +149,7 @@ function format(data, indent = 0) {
 }
 
 function formatPlain(data) {
+  if (data && typeof data === "object" && Array.isArray(data.items)) return formatPlain(data.items);
   if (Array.isArray(data)) {
     return data.map((item) => formatPlain(item)).filter(Boolean).join("\n");
   }
@@ -159,6 +165,48 @@ function formatPlain(data) {
 function die(message, code = 1) {
   console.error(`ft: ${message}`);
   exit(code);
+}
+
+function validSet(values) {
+  return values.map((value) => String(value)).join(", ");
+}
+
+function parseIntegerFlag(flags, key, { defaultValue, min, max }) {
+  const raw = flags[key];
+  if (raw === undefined) return defaultValue;
+  const value = Number.parseInt(String(raw), 10);
+  const flag = `--${key.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`)}`;
+  if (!Number.isInteger(value) || String(value) !== String(raw) || value < min || value > max) {
+    die(`${flag} must be an integer from ${min} to ${max} (got: ${JSON.stringify(raw)})`, 2);
+  }
+  return value;
+}
+
+function paginate(items, flags, noun, narrowHint = `add --limit=N or --cursor=${DEFAULT_LIST_LIMIT}`) {
+  const limit = parseIntegerFlag(flags, "limit", { defaultValue: DEFAULT_LIST_LIMIT, min: 1, max: MAX_LIST_LIMIT });
+  const offset = parseIntegerFlag(flags, "cursor", { defaultValue: 0, min: 0, max: Number.MAX_SAFE_INTEGER });
+  const pageItems = items.slice(offset, offset + limit);
+  const nextOffset = offset + pageItems.length;
+  const truncated = nextOffset < items.length;
+  return {
+    items: pageItems,
+    total: items.length,
+    limit,
+    cursor: offset,
+    nextCursor: truncated ? String(nextOffset) : null,
+    truncated,
+    hint: truncated ? `${noun} output truncated; ${narrowHint}.` : null,
+  };
+}
+
+function printList(items, flags, noun, narrowHint) {
+  const page = paginate(items, flags, noun, narrowHint);
+  if (flags.json) {
+    print(page, flags);
+    return;
+  }
+  if (page.truncated && !flags.plain && !(flags.quiet || flags.q)) console.error(`ft: ${page.hint}`);
+  print(page.items, flags);
 }
 
 function frontierPath(start = cwd()) {
@@ -681,6 +729,7 @@ Usage:
   ft session start <title> [--actor <actor>]
   ft session current|attach <ref>|refs|context [--json|--plain]
   ft wiki list|show <domain>|entrypoints|related <ref> [--json|--plain]
+  ft agent-context [--json]
   ft agent docs codex|claude
   ft agent write codex|claude [--path AGENTS.md]
   ft trace <ref> [--json]
@@ -696,6 +745,8 @@ Global flags:
   --no-color       Disable color. Frontier currently emits no color.
   --frontier-dir <path>
                    Use a specific .frontier directory.
+  --limit <n>      Limit list-style output to 1-${MAX_LIST_LIMIT} items. Default: ${DEFAULT_LIST_LIMIT}.
+  --cursor <n>     Continue list-style output from an offset cursor.
 
 Safety:
   --dry-run        Validate write commands without changing files.
@@ -732,6 +783,7 @@ function commandHelp(command, subcommand) {
     "wiki map": "usage: ft wiki map <domain> [--json]",
     "wiki entrypoints": "usage: ft wiki entrypoints [--json]",
     "wiki related": "usage: ft wiki related <ref> [--json|--plain]",
+    "agent-context": "usage: ft agent-context [--json]",
     "agent docs": "usage: ft agent docs codex|claude [--json]",
     "agent write": "usage: ft agent write codex|claude [--path AGENTS.md] [--force] [--dry-run]",
     trace: "usage: ft trace <ref> [--json]",
@@ -826,7 +878,7 @@ function handleProjects(flags) {
 
 function handleTypedRecords(type, subcommand, args, flags) {
   const allowed = {
-    list: [],
+    list: ["limit", "cursor"],
     show: [],
     add: ["title", "tags", "dryRun"],
     file: ["title", "tags", "observedAt", "dryRun"],
@@ -838,7 +890,7 @@ function handleTypedRecords(type, subcommand, args, flags) {
   const store = loaded.data;
 
   if (subcommand === "list") {
-    print(recordsByType(store, type).map(summarizeRecord), flags);
+    printList(recordsByType(store, type).map(summarizeRecord), flags, `${type} list`, "add --limit=N or use --cursor=<nextCursor>");
     return;
   }
 
@@ -909,7 +961,7 @@ function handleSession(subcommand, args, flags) {
     start: ["actor", "interface", "title", "dryRun"],
     current: [],
     attach: ["dryRun"],
-    refs: [],
+    refs: ["limit", "cursor"],
     context: [],
   };
   validateFlags(flags, allowed[subcommand] || []);
@@ -954,7 +1006,7 @@ function handleSession(subcommand, args, flags) {
     const refs = store.links
       .filter((link) => link.fromId === session.id && link.type === "attached_record")
       .map((link) => summarizeRecord(requireRecord(store, link.toId)));
-    print(refs, flags);
+    printList(refs, flags, "session refs", "add --limit=N or use --cursor=<nextCursor>");
     return;
   }
 
@@ -1017,9 +1069,9 @@ function readBody(input) {
 
 function handleActions(subcommand, args, flags) {
   const allowed = {
-    list: [],
+    list: ["limit", "cursor"],
     show: [],
-    search: [],
+    search: ["limit", "cursor"],
     create: ["title", "type", "fromSynthesis", "body", "status", "dryRun"],
   };
   validateFlags(flags, allowed[subcommand] || []);
@@ -1027,7 +1079,7 @@ function handleActions(subcommand, args, flags) {
   const store = loaded.data;
 
   if (subcommand === "list") {
-    print(recordsByType(store, "action").map(summarizeRecord), flags);
+    printList(recordsByType(store, "action").map(summarizeRecord), flags, "actions list", "add --limit=N or use --cursor=<nextCursor>");
     return;
   }
 
@@ -1042,7 +1094,7 @@ function handleActions(subcommand, args, flags) {
     const matches = recordsByType(store, "action").filter((record) => {
       return record.title.toLowerCase().includes(query) || record.body.toLowerCase().includes(query);
     });
-    print(matches.map(summarizeRecord), flags);
+    printList(matches.map(summarizeRecord), flags, "actions search", "add a narrower query, --limit=N, or use --cursor=<nextCursor>");
     return;
   }
 
@@ -1101,7 +1153,7 @@ function handleTrace(args, flags) {
 }
 
 function handleWiki(subcommand, args, flags) {
-  validateFlags(flags);
+  validateFlags(flags, ["limit", "cursor"]);
   const loaded = loadStore();
   const store = loaded.data;
   const domains = ["context", "ingestion", "synthesis", "actions"];
@@ -1115,11 +1167,11 @@ function handleWiki(subcommand, args, flags) {
     const domain = args[0];
     const type = domain === "actions" ? "action" : domain;
     if (!domain) die(commandHelp("wiki", subcommand), 2);
-    if (!RECORD_TYPES.has(type)) die(`unknown wiki domain: ${domain}`, 2);
+    if (!RECORD_TYPES.has(type)) die(`unknown wiki domain: ${domain}. Domain must be one of: ${validSet(domains)} (got: ${JSON.stringify(domain)})`, 2);
     print({
       wiki: domain,
       entrypoints: recordsByType(store, type).slice(0, 5).map(summarizeRecord),
-      records: recordsByType(store, type).map(summarizeRecord),
+      records: paginate(recordsByType(store, type).map(summarizeRecord), flags, `${domain} wiki`, "add --limit=N or use --cursor=<nextCursor>"),
     }, flags);
     return;
   }
@@ -1142,11 +1194,203 @@ function handleWiki(subcommand, args, flags) {
       if (link.fromId === record.id) relatedIds.add(link.toId);
       if (link.toId === record.id) relatedIds.add(link.fromId);
     }
-    print([...relatedIds].map((id) => summarizeRecord(requireRecord(store, id))), flags);
+    printList([...relatedIds].map((id) => summarizeRecord(requireRecord(store, id))), flags, "related records", "add --limit=N or use --cursor=<nextCursor>");
     return;
   }
 
   die(`unknown command: ft wiki ${subcommand || ""}`.trim(), 2);
+}
+
+function commandSpec(summary, flags = {}, options = {}) {
+  return {
+    summary,
+    usage: options.usage,
+    args: options.args || [],
+    flags: {
+      "--json": { type: "bool", default: false },
+      ...flags,
+    },
+    mutates: Boolean(options.mutates),
+    outputs: options.outputs || ["human", "json"],
+  };
+}
+
+function listFlags() {
+  return {
+    "--plain": { type: "bool", default: false },
+    "--limit": { type: "integer", min: 1, max: MAX_LIST_LIMIT, default: DEFAULT_LIST_LIMIT },
+    "--cursor": { type: "integer", min: 0, default: 0 },
+  };
+}
+
+function agentContext(loaded) {
+  const store = loaded?.data || null;
+  const current = store ? currentSession(store) : null;
+  return {
+    schema_version: AGENT_CONTEXT_SCHEMA_VERSION,
+    cli: {
+      name: "ft",
+      version: CLI_VERSION,
+      description: "Project-local system of record for context, ingestion, synthesis, actions, sessions, and provenance.",
+    },
+    conventions: {
+      output: "Use --json for machine-readable output. Primary data is written to stdout; diagnostics and errors are written to stderr.",
+      exit_codes: {
+        0: "success",
+        1: "runtime failure",
+        2: "invalid usage",
+      },
+      mutation_safety: "Write commands support --dry-run. Destructive overwrites require --force.",
+      input_precedence: ["explicit flag", "environment variable", "project config", "default"],
+      list_pagination: {
+        default_limit: DEFAULT_LIST_LIMIT,
+        max_limit: MAX_LIST_LIMIT,
+        cursor: "Pass the returned nextCursor value as --cursor.",
+      },
+    },
+    project: store
+      ? {
+          name: store.project.name,
+          id: store.project.id,
+          path: loaded.dir,
+          current_session: current ? summarizeRecord(current) : null,
+          record_counts: Object.fromEntries(["context", "ingestion", "synthesis", "action", "session", "artifact"].map((type) => [type, recordsByType(store, type).length])),
+        }
+      : null,
+    available_profiles: [],
+    commands: {
+      init: {
+        command: commandSpec("Create a project-local Frontier store.", { "--dry-run": { type: "bool", default: false } }, { usage: "ft init <name> [--dry-run]", args: ["name"], mutates: true }),
+      },
+      use: {
+        command: commandSpec("Verify and select the project-local Frontier workspace.", { "--plain": { type: "bool", default: false } }, { usage: "ft use <name>", args: ["name"] }),
+      },
+      projects: {
+        command: commandSpec("List discoverable Frontier projects.", { "--plain": { type: "bool", default: false } }, { usage: "ft projects [--json|--plain]" }),
+      },
+      status: {
+        command: commandSpec("Inspect whether the current directory is inside a Frontier project.", { "--plain": { type: "bool", default: false } }, { usage: "ft status [--json|--plain]" }),
+      },
+      context: {
+        add: commandSpec(
+          "Add a durable context file.",
+          {
+            "--title": { type: "string", required: false },
+            "--tags": { type: "string", required: false, format: "comma-separated refs" },
+            "--dry-run": { type: "bool", default: false },
+          },
+          { usage: "ft context add <file> [--title <title>] [--tags <refs>] [--dry-run]", args: ["file"], mutates: true },
+        ),
+        list: commandSpec("List context records.", listFlags(), { usage: "ft context list [--json|--plain] [--limit <n>] [--cursor <n>]" }),
+        show: commandSpec("Show a full context record by ref, id, or title slug.", {}, { usage: "ft context show <ref> [--json]", args: ["ref"] }),
+      },
+      ingest: {
+        file: commandSpec(
+          "Ingest a file as source material.",
+          {
+            "--title": { type: "string", required: false },
+            "--tags": { type: "string", required: false, format: "comma-separated refs" },
+            "--observed-at": { type: "string", required: false, format: "ISO datetime" },
+            "--dry-run": { type: "bool", default: false },
+          },
+          { usage: "ft ingest file <file> [--title <title>] [--tags <refs>] [--observed-at <iso>] [--dry-run]", args: ["file"], mutates: true },
+        ),
+        text: commandSpec(
+          "Ingest literal or stdin text as source material.",
+          {
+            "--title": { type: "string", required: true },
+            "--stdin": { type: "bool", default: false },
+            "--tags": { type: "string", required: false, format: "comma-separated refs" },
+            "--observed-at": { type: "string", required: false, format: "ISO datetime" },
+            "--dry-run": { type: "bool", default: false },
+          },
+          { usage: "ft ingest text <text>|--stdin --title <title> [--tags <refs>] [--observed-at <iso>] [--dry-run]", args: ["text"], mutates: true },
+        ),
+        list: commandSpec("List ingestion records.", listFlags(), { usage: "ft ingest list [--json|--plain] [--limit <n>] [--cursor <n>]" }),
+        show: commandSpec("Show a full ingestion record by ref, id, or title slug.", {}, { usage: "ft ingest show <ref> [--json]", args: ["ref"] }),
+      },
+      synth: {
+        create: commandSpec(
+          "Record a synthesis run that combines context and ingestion.",
+          {
+            "--goal": { type: "string", required: true },
+            "--context": { type: "string", required: false, format: "comma-separated refs" },
+            "--ingestion": { type: "string", required: false, format: "comma-separated refs" },
+            "--summary": { type: "string", required: false },
+            "--prompt": { type: "string", required: false },
+            "--agent": { type: "string", required: false },
+            "--model": { type: "string", required: false },
+            "--dry-run": { type: "bool", default: false },
+          },
+          { usage: "ft synth create --goal <goal> [--context <refs>] [--ingestion <refs>] [--summary <text>] [--prompt <text>] [--agent <name>] [--model <name>] [--dry-run]", mutates: true },
+        ),
+      },
+      actions: {
+        create: commandSpec(
+          "Create an action output, optionally linked to a synthesis.",
+          {
+            "--type": { type: "string", required: true },
+            "--title": { type: "string", required: true },
+            "--from-synthesis": { type: "string", required: false, format: "ref" },
+            "--body": { type: "string", required: true, format: "file path, literal text, or -" },
+            "--status": { type: "string", required: false, default: "draft" },
+            "--dry-run": { type: "bool", default: false },
+          },
+          { usage: "ft actions create --type <type> --title <title> [--from-synthesis <ref>] --body <file-or-text|-> [--status <status>] [--dry-run]", mutates: true },
+        ),
+        list: commandSpec("List action records.", listFlags(), { usage: "ft actions list [--json|--plain] [--limit <n>] [--cursor <n>]" }),
+        show: commandSpec("Show a full action record by ref, id, or title slug.", {}, { usage: "ft actions show <ref> [--json]", args: ["ref"] }),
+        search: commandSpec("Search action titles and bodies.", listFlags(), { usage: "ft actions search <query> [--json|--plain] [--limit <n>] [--cursor <n>]", args: ["query"] }),
+      },
+      session: {
+        start: commandSpec(
+          "Start and select the current work session.",
+          {
+            "--actor": { type: "string", required: false, default: "human" },
+            "--interface": { type: "string", required: false, default: "cli" },
+            "--dry-run": { type: "bool", default: false },
+          },
+          { usage: "ft session start <title> [--actor <actor>] [--interface <name>] [--dry-run]", args: ["title"], mutates: true },
+        ),
+        current: commandSpec("Show the current session.", { "--plain": { type: "bool", default: false } }, { usage: "ft session current [--json|--plain]" }),
+        attach: commandSpec("Attach a record to the current session.", { "--dry-run": { type: "bool", default: false } }, { usage: "ft session attach <ref> [--dry-run]", args: ["ref"], mutates: true }),
+        refs: commandSpec("List records attached to the current session.", listFlags(), { usage: "ft session refs [--json|--plain] [--limit <n>] [--cursor <n>]" }),
+        context: commandSpec("Show bounded current-session context, recent synthesis, actions, and events.", {}, { usage: "ft session context [--json]" }),
+      },
+      wiki: {
+        list: commandSpec("List wiki domains.", { "--plain": { type: "bool", default: false } }, { usage: "ft wiki list [--json|--plain]" }),
+        show: commandSpec("Show a wiki domain and paginated records.", listFlags(), { usage: "ft wiki show <domain> [--json] [--limit <n>] [--cursor <n>]", args: ["domain"] }),
+        map: commandSpec("Alias of wiki show for a wiki domain.", listFlags(), { usage: "ft wiki map <domain> [--json] [--limit <n>] [--cursor <n>]", args: ["domain"] }),
+        entrypoints: commandSpec("Show compact entrypoints for each wiki domain.", {}, { usage: "ft wiki entrypoints [--json]" }),
+        related: commandSpec("List records related to a ref.", listFlags(), { usage: "ft wiki related <ref> [--json|--plain] [--limit <n>] [--cursor <n>]", args: ["ref"] }),
+      },
+      "agent-context": {
+        command: commandSpec("Print this versioned machine-readable command map.", {}, { usage: "ft agent-context [--json]" }),
+      },
+      agent: {
+        docs: commandSpec("Print long-form agent workflow instructions.", {}, { usage: "ft agent docs codex|claude [--json]", args: ["agent"], outputs: ["human", "json"] }),
+        write: commandSpec(
+          "Write long-form agent workflow instructions to a file.",
+          {
+            "--path": { type: "string", required: false, default: "AGENTS.md" },
+            "--force": { type: "bool", default: false },
+            "--dry-run": { type: "bool", default: false },
+          },
+          { usage: "ft agent write codex|claude [--path AGENTS.md] [--force] [--dry-run]", args: ["agent"], mutates: true },
+        ),
+      },
+      trace: {
+        command: commandSpec("Trace an action or record through provenance links.", {}, { usage: "ft trace <ref> [--json]", args: ["ref"] }),
+      },
+    },
+  };
+}
+
+function handleAgentContext(flags) {
+  validateFlags(flags);
+  if (flags.plain) die("ft agent-context only supports JSON output. Use `ft agent-context --json`.", 2);
+  const loaded = loadStore(false);
+  print(agentContext(loaded), { ...flags, json: true });
 }
 
 function agentDocs(agent) {
@@ -1263,9 +1507,10 @@ function main() {
   if (command === "actions") return handleActions(subcommand, args, flags);
   if (command === "trace") return handleTrace([subcommand, ...args].filter(Boolean), flags);
   if (command === "wiki") return handleWiki(subcommand, args, flags);
+  if (command === "agent-context") return handleAgentContext(flags);
   if (command === "agent") return handleAgent(subcommand, args, flags);
 
-  die(`unknown command: ft ${command}`, 2);
+  die(`unknown command: ft ${command}. Command must be one of: ${validSet(["init", "use", "projects", "status", "context", "ingest", "synth", "actions", "session", "wiki", "agent-context", "agent", "trace"])} (got: ${JSON.stringify(command)})`, 2);
 }
 
 main();
